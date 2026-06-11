@@ -6,6 +6,7 @@
   <ItemGroup>
     <PackageReference Include="AsyncKeyedLock" />
     <PackageReference Include="Gress" />
+    <PackageReference Include="HttpCloak" />
     <PackageReference Include="JsonExtensions" />
     <PackageReference Include="Polly" />
     <PackageReference Include="PowerKit" PrivateAssets="all" />
