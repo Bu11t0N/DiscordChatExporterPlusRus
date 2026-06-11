@@ -12,6 +12,7 @@ using DiscordChatExporter.Core.Discord.Data;
 using DiscordChatExporter.Core.Exceptions;
 using DiscordChatExporter.Core.Utils;
 using Gress;
+using HttpCloak;
 using JsonExtensions.Http;
 using JsonExtensions.Reading;
 using PowerKit.Extensions;
@@ -22,11 +23,30 @@ namespace DiscordChatExporter.Core.Discord;
 public class DiscordClient(
     string token,
     RateLimitPreference rateLimitPreference = RateLimitPreference.RespectAll
-)
+) : IDisposable
 {
     private readonly Uri _baseUri = new("https://discord.com/api/v10/", UriKind.Absolute);
+    private readonly Session _session = new(preset: Presets.ChromeLatest, retry: 0);
     private TokenKind? _resolvedTokenKind;
     private static Dictionary<string, string>? _cachedBrowserHeaders;
+
+    private static HttpResponseMessage ToHttpResponseMessage(Response source, Uri requestUri)
+    {
+        var response = new HttpResponseMessage((HttpStatusCode)source.StatusCode)
+        {
+            Content = new ByteArrayContent(source.Content),
+            ReasonPhrase = source.Reason,
+            RequestMessage = new HttpRequestMessage(HttpMethod.Get, requestUri),
+        };
+
+        foreach (var (name, values) in source.Headers)
+        {
+            if (!response.Headers.TryAddWithoutValidation(name, values))
+                response.Content.Headers.TryAddWithoutValidation(name, values);
+        }
+
+        return response;
+    }
 
     private async ValueTask<HttpResponseMessage> GetResponseAsync(
         string url,
@@ -37,19 +57,28 @@ public class DiscordClient(
         return await Http.ResponseResiliencePipeline.ExecuteAsync(
             async innerCancellationToken =>
             {
-                using var request = new HttpRequestMessage(HttpMethod.Get, new Uri(_baseUri, url));
+                var requestUri = new Uri(_baseUri, url);
+                var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
                 // Don't validate because the token can have special characters
                 // https://github.com/Tyrrrz/DiscordChatExporter/issues/828
-                request.Headers.TryAddWithoutValidation(
-                    "Authorization",
-                    tokenKind == TokenKind.Bot ? $"Bot {token}" : token
-                );
+                headers["Authorization"] = tokenKind == TokenKind.Bot ? $"Bot {token}" : token;
 
-            // add browser headers like x-super-properties and user-agent
-            // discord flags requests that don't look like a real browser
-            if (tokenKind != TokenKind.Bot)
-            {
+                if (tokenKind == TokenKind.Bot)
+                {
+                    using var request = new HttpRequestMessage(HttpMethod.Get, requestUri);
+                    foreach (var (name, value) in headers)
+                        request.Headers.TryAddWithoutValidation(name, value);
+
+                    return await Http.Client.SendAsync(
+                        request,
+                        HttpCompletionOption.ResponseHeadersRead,
+                        innerCancellationToken
+                    );
+                }
+
+                // add browser headers like x-super-properties and user-agent
+                // discord flags requests that don't look like a real browser
                 try
                 {
                     // Cache headers from the external API so we don't make this request on every call.
@@ -61,10 +90,15 @@ public class DiscordClient(
                             "https://cordapi.dolfi.es/api/v2/properties/web"
                         );
 
-                        using var apiRes = await Http.Client.SendAsync(apiReq, innerCancellationToken);
+                        using var apiRes = await Http.Client.SendAsync(
+                            apiReq,
+                            innerCancellationToken
+                        );
                         apiRes.EnsureSuccessStatusCode();
 
-                        var apiJson = await apiRes.Content.ReadAsStringAsync(innerCancellationToken);
+                        var apiJson = await apiRes.Content.ReadAsStringAsync(
+                            innerCancellationToken
+                        );
 
                         using var doc = JsonDocument.Parse(apiJson);
 
@@ -74,13 +108,17 @@ public class DiscordClient(
 
                         var properties = root.GetProperty("properties");
 
-                        string userAgent = properties.GetProperty("browser_user_agent").GetString()!;
-                        string browserVersion = properties.GetProperty("browser_version").GetString()!;
+                        string userAgent = properties
+                            .GetProperty("browser_user_agent")
+                            .GetString()!;
+                        string browserVersion = properties
+                            .GetProperty("browser_version")
+                            .GetString()!;
                         string osType = properties.GetProperty("os").GetString()!;
 
                         string chromeMajor = browserVersion.Split('.')[0];
 
-                        var headers = new Dictionary<string, string>
+                        var browserHeaders = new Dictionary<string, string>
                         {
                             ["sec-ch-ua-platform"] = $"\"{osType}\"",
                             ["referer"] = "https://discord.com/app",
@@ -100,20 +138,21 @@ public class DiscordClient(
                             ["x-super-properties"] = xspBase64,
                         };
 
-                        _cachedBrowserHeaders = headers;
+                        _cachedBrowserHeaders = browserHeaders;
                     }
 
                     foreach (var kv in _cachedBrowserHeaders)
-                         if (!request.Headers.Contains(kv.Key)) request.Headers.TryAddWithoutValidation(kv.Key, kv.Value);
-                } 
+                        headers.TryAdd(kv.Key, kv.Value);
+                }
                 catch {}
-            }
 
-                var response = await Http.Client.SendAsync(
-                    request,
-                    HttpCompletionOption.ResponseHeadersRead,
-                    innerCancellationToken
+                var cloakResponse = await _session.GetAsync(
+                    requestUri.ToString(),
+                    headers: headers,
+                    cancellationToken: innerCancellationToken
                 );
+
+                var response = ToHttpResponseMessage(cloakResponse, requestUri);
 
                 // Discord has advisory rate limits (communicated via response headers), but they are typically
                 // way stricter than the actual rate limits enforced by the server.
@@ -885,4 +924,6 @@ public class DiscordClient(
                 yield break;
         }
     }
+
+    public void Dispose() => _session.Dispose();
 }
